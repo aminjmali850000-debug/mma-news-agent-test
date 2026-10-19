@@ -215,3 +215,12 @@ ham,یادت باشه شیر و نون بخری
 * Inspired by the spam filter and Naive Bayes examples in the Elements of AI / Building AI course
 * All example messages were written by me
 * Created by aminjmali850000
+# MMA News Agent
+عامل هوشمند اخبار ورزش‌های رزمی با پنل مدیریتی فارسی.
+
+## وضعیت
+مرحله ۱: پنل پایه و اتصال تلگرام.
+
+## تنظیمات
+فایل .env.example را ببینید. مقادیر واقعی را فقط در
+متغیرهای محیطی سرویس ابری وارد کنید، نه در GitHub.
