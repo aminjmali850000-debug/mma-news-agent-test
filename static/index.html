@@ -1,0 +1,161 @@
+import hmac
+import logging
+import os
+import secrets
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, Request
+from fastapi.responses import FileResponse, JSONResponse
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).parent
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
+
+SESSION_TTL = 12 * 3600
+MAX_FAILED_LOGINS = 5
+LOCK_SECONDS = 600
+
+# جلوگیری از ثبت آدرس‌هایی که شامل توکن هستند
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logger = logging.getLogger("mma-agent")
+
+activity_log = deque(maxlen=200)
+sessions = {}
+failed_logins = {}
+
+app = FastAPI(title="MMA News Agent")
+
+
+class AppError(Exception):
+    def __init__(self, status: int, message: str):
+        self.status = status
+        self.message = message
+
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    return JSONResponse({"error": exc.message}, status_code=exc.status)
+
+
+def log_event(level: str, message: str):
+    activity_log.appendleft(
+        {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+         "level": level, "message": message}
+    )
+    getattr(logger, "error" if level == "error" else "info")(message)
+
+
+def require_auth(x_token: str = Header(default="")):
+    expiry = sessions.get(x_token)
+    if not x_token or not expiry or expiry < time.time():
+        sessions.pop(x_token, None)
+        raise AppError(401, "نشست شما منقضی شده است. دوباره وارد شوید.")
+
+
+async def telegram_call(method: str, payload: dict | None = None):
+    if not TELEGRAM_BOT_TOKEN:
+        raise AppError(400, "توکن ربات تلگرام تنظیم نشده است.")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=payload or {})
+    except httpx.TimeoutException:
+        raise AppError(504, "پاسخ تلگرام دیر آمد. چند لحظه بعد دوباره تلاش کنید.")
+    except httpx.HTTPError:
+        raise AppError(502, "اتصال به تلگرام برقرار نشد. اینترنت سرور را بررسی کنید.")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise AppError(502, "پاسخ نامعتبر از تلگرام دریافت شد.")
+    if not data.get("ok"):
+        code = data.get("error_code")
+        if code == 401:
+            msg = "توکن ربات اشتباه است. آن را از BotFather دوباره کپی کنید."
+        elif code == 400:
+            msg = "کانال پیدا نشد یا شناسه کانال اشتباه است."
+        elif code == 403:
+            msg = "ربات به کانال دسترسی ندارد. آن را مدیر (Admin) کانال کنید."
+        elif code == 429:
+            msg = "تعداد درخواست‌ها زیاد است. کمی صبر کنید."
+        else:
+            msg = "تلگرام درخواست را نپذیرفت."
+        raise AppError(502, msg)
+    return data["result"]
+
+
+@app.get("/")
+async def index():
+    return FileResponse(BASE_DIR / "static" / "index.html")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/login")
+async def login(request: Request, body: dict):
+    ip = request.client.host if request.client else "unknown"
+    count, first = failed_logins.get(ip, (0, time.time()))
+    if time.time() - first > LOCK_SECONDS:
+        count, first = 0, time.time()
+    if count >= MAX_FAILED_LOGINS:
+        raise AppError(429, "تلاش‌های ناموفق زیاد بود. ۱۰ دقیقه بعد دوباره امتحان کنید.")
+    if not ADMIN_PASSWORD:
+        raise AppError(500, "رمز پنل (ADMIN_PASSWORD) روی سرور تنظیم نشده است.")
+    password = str(body.get("password", ""))
+    if not hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode()):
+        failed_logins[ip] = (count + 1, first)
+        log_event("error", "تلاش ناموفق برای ورود به پنل")
+        raise AppError(401, "رمز اشتباه است.")
+    failed_logins.pop(ip, None)
+    token = secrets.token_urlsafe(32)
+    sessions[token] = time.time() + SESSION_TTL
+    log_event("info", "ورود موفق به پنل")
+    return {"token": token}
+
+
+@app.get("/api/status", dependencies=[Depends(require_auth)])
+async def status():
+    return {
+        "telegram_token_set": bool(TELEGRAM_BOT_TOKEN),
+        "channel_set": bool(TELEGRAM_CHANNEL_ID),
+    }
+
+
+@app.post("/api/telegram/check", dependencies=[Depends(require_auth)])
+async def telegram_check():
+    me = await telegram_call("getMe")
+    log_event("info", f"ربات تلگرام معتبر است: @{me.get('username')}")
+    return {"message": f"ربات معتبر است: @{me.get('username')}"}
+
+
+@app.post("/api/telegram/test", dependencies=[Depends(require_auth)])
+async def telegram_test():
+    if not TELEGRAM_CHANNEL_ID:
+        raise AppError(400, "شناسه کانال (TELEGRAM_CHANNEL_ID) تنظیم نشده است.")
+    try:
+        await telegram_call("sendMessage", {
+            "chat_id": TELEGRAM_CHANNEL_ID,
+            "text": "✅ پیام آزمایشی از MMA News Agent",
+        })
+    except AppError as e:
+        log_event("error", f"ارسال پیام آزمایشی ناموفق: {e.message}")
+        raise
+    log_event("info", "پیام آزمایشی به کانال ارسال شد")
+    return {"message": "پیام آزمایشی با موفقیت به کانال ارسال شد."}
+
+
+@app.get("/api/logs", dependencies=[Depends(require_auth)])
+async def logs():
+    return {"logs": list(activity_log)}
